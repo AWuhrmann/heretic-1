@@ -9,7 +9,6 @@ from .progress import patch_tqdm
 # before any other module imports tqdm.
 patch_tqdm()
 
-import logging
 import math
 import os
 import sys
@@ -19,13 +18,9 @@ from dataclasses import asdict
 from importlib.metadata import version
 from os.path import commonprefix
 from pathlib import Path
-from typing import Any
 
 import huggingface_hub
-import lm_eval
-import numpy as np
 import optuna
-import questionary
 import torch
 import torch.nn.functional as F
 import transformers
@@ -37,7 +32,6 @@ from accelerate.utils import (
     is_xpu_available,
 )
 from huggingface_hub import ModelCard, ModelCardData
-from lm_eval.models.huggingface import HFLM
 from optuna import Trial, TrialPruned
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers import TPESampler
@@ -46,7 +40,7 @@ from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 from optuna.study import StudyDirection
 from optuna.trial import TrialState
 from pydantic import ValidationError
-from questionary import Choice, Style
+from questionary import Choice
 from rich.table import Table
 from rich.traceback import install
 
@@ -73,7 +67,7 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
     """
     Prompts the user for how to proceed with saving the model.
     Provides info to the user if the model is quantized on memory use.
-    Returns "merge", "adapter", or None (if cancelled/invalid).
+    Returns "merge", "adapter", or None (if cancelled).
     """
 
     if settings.quantization == QuantizationMethod.BNB_4BIT:
@@ -116,31 +110,33 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
             )
         print()
 
-        strategy = prompt_select(
-            "How do you want to proceed?",
-            choices=[
-                Choice(
-                    title="Merge LoRA into full model"
-                    + (
-                        ""
-                        if settings.quantization == QuantizationMethod.NONE
-                        else " (requires sufficient RAM)"
-                    ),
-                    value="merge",
+    strategy = prompt_select(
+        "How do you want to proceed?",
+        choices=[
+            Choice(
+                title="Merge LoRA into full model"
+                + (
+                    " (requires sufficient RAM)"
+                    if settings.quantization == QuantizationMethod.BNB_4BIT
+                    else ""
                 ),
-                Choice(
-                    title="Cancel",
-                    value="cancel",
-                ),
-            ],
-        )
+                value="merge",
+            ),
+            Choice(
+                title="Save LoRA adapter only",
+                value="adapter",
+            ),
+            Choice(
+                title="Cancel",
+                value="cancel",
+            ),
+        ],
+    )
 
-        if strategy == "cancel":
-            return None
+    if strategy == "cancel":
+        return None
 
-        return strategy
-    else:
-        return "merge"
+    return strategy
 
 
 def run():
@@ -239,9 +235,6 @@ def run():
     # Silence warning spam from Transformers.
     # In my entire career I've never seen a useful warning from that library.
     transformers.logging.set_verbosity_error()
-
-    # Another library that generates warning spam.
-    logging.getLogger("lm_eval").setLevel(logging.ERROR)
 
     # We do our own trial logging, so we don't need the INFO messages
     # about parameters and results.
@@ -927,20 +920,6 @@ def run():
                                     break
 
                         case "Benchmark the model":
-                            benchmarks = questionary.checkbox(
-                                "Which benchmarks do you want to run?",
-                                [
-                                    Choice(
-                                        title=f"{benchmark.name}: {benchmark.description}",
-                                        value=benchmark,
-                                    )
-                                    for benchmark in settings.benchmarks
-                                ],
-                                style=Style([("highlighted", "reverse")]),
-                            ).ask()
-                            if not benchmarks:
-                                continue
-
                             scope = prompt_select(
                                 (
                                     "Do you want to benchmark the original model along with the decensored model? "
@@ -955,83 +934,59 @@ def run():
                                 continue
                             benchmark_original_model = scope == "Benchmark both models"
 
-                            hflm = HFLM(
-                                pretrained=model.model,  # ty:ignore[invalid-argument-type]
-                                tokenizer=model.tokenizer,  # ty:ignore[invalid-argument-type]
-                                batch_size="auto",
-                            )
-
-                            table = Table()
-                            table.add_column("Benchmark")
-                            table.add_column("Metric")
-                            if benchmark_original_model:
-                                table.add_column("This model", justify="right")
-                                table.add_column("Original model", justify="right")
-                            else:
-                                table.add_column("Value", justify="right")
-
                             try:
-                                first_benchmark = True
+                                print("Counting model refusals...")
+                                responses = model.get_responses_batched(
+                                    evaluator.bad_prompts,
+                                    skip_special_tokens=True,
+                                )
+                                refusal_count = sum(
+                                    1
+                                    for response in responses
+                                    if evaluator.is_refusal(response)
+                                )
 
-                                for benchmark in benchmarks:
-                                    print(
-                                        f"Running benchmark [bold]{benchmark.name}[/]..."
+                                original_refusal_count: int | None = None
+                                if benchmark_original_model:
+                                    print("Counting original model refusals...")
+                                    with model.model.disable_adapter():  # ty:ignore[call-non-callable]
+                                        original_responses = (
+                                            model.get_responses_batched(
+                                                evaluator.bad_prompts,
+                                                skip_special_tokens=True,
+                                            )
+                                        )
+                                    original_refusal_count = sum(
+                                        1
+                                        for response in original_responses
+                                        if evaluator.is_refusal(response)
                                     )
 
-                                    def get_results() -> dict[str, Any]:
-                                        results = lm_eval.simple_evaluate(
-                                            model=hflm,
-                                            tasks=[benchmark.task],
-                                        )
-                                        return results["results"][benchmark.task]
+                                total = len(evaluator.bad_prompts)
 
-                                    results = get_results()
-                                    if benchmark_original_model:
-                                        with model.model.disable_adapter():  # ty:ignore[call-non-callable]
-                                            original_results = get_results()
+                                def format_refusal_rate(count: int) -> str:
+                                    return f"{count / total:.2%} ({count}/{total})"
 
-                                    first_row = True
+                                table = Table()
+                                table.add_column("Metric")
+                                cells = [
+                                    "Refusal rate",
+                                    format_refusal_rate(refusal_count),
+                                ]
+                                if benchmark_original_model:
+                                    table.add_column("This model", justify="right")
+                                    table.add_column("Original model", justify="right")
+                                    assert original_refusal_count is not None
+                                    cells.append(
+                                        format_refusal_rate(original_refusal_count)
+                                    )
+                                else:
+                                    table.add_column("Value", justify="right")
+                                table.add_row(*cells)
+                                print(table)
 
-                                    for metric, value in results.items():
-                                        if metric != "alias":
-                                            if first_row and not first_benchmark:
-                                                if benchmark_original_model:
-                                                    table.add_row("", "", "", "")
-                                                else:
-                                                    table.add_row("", "", "")
-
-                                            def format_value(value: Any) -> str:
-                                                if isinstance(
-                                                    value,
-                                                    (float, np.floating),
-                                                ):
-                                                    return f"{value:.4f}"
-                                                else:
-                                                    return f"{value}"
-
-                                            cells = [
-                                                benchmark.name if first_row else "",
-                                                metric,
-                                                format_value(value),
-                                            ]
-                                            if benchmark_original_model:
-                                                cells.append(
-                                                    format_value(
-                                                        original_results[metric]
-                                                    )
-                                                )
-                                            table.add_row(*cells)
-
-                                            first_row = False
-                                            first_benchmark = False
                             except KeyboardInterrupt:
                                 pass
-
-                            # The benchmark run might have been cancelled by the user
-                            # before any benchmark was completed, so we only print results
-                            # if there actually are some.
-                            if table.rows:
-                                print(table)
 
                 except Exception as error:
                     print(f"[red]Error: {error}[/]")
