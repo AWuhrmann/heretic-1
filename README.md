@@ -4,6 +4,17 @@
 
 [![#1 Repository of the Day](https://trendshift.io/api/badge/repositories/20538)](https://trendshift.io/repositories/20538)
 
+> **This is a fork of [p-e-w/heretic](https://github.com/p-e-w/heretic)** maintained by [AWuhrmann](https://github.com/AWuhrmann).
+> The main changes relative to upstream are:
+> - **TFBench evaluation**: the lm-eval benchmark suite is replaced by a lightweight refusal-rate counter
+>   using the [AWuhrmann/TFBench-short](https://huggingface.co/datasets/AWuhrmann/TFBench-short) dataset,
+>   making the "Benchmark the model" step much faster.
+> - **Multilingual refusal detection**: `is_refusal()` is rewritten with language-specific heuristics
+>   for French, English, German, and Italian, plus Unicode normalization via `unidecode`, reducing
+>   false positives on multilingual models.
+> - **Shorter response generation**: `max_response_length` defaults to 32 tokens (down from 100)
+>   to speed up evaluation without affecting refusal classification accuracy.
+
 Heretic is a tool that removes censorship (aka "safety alignment") from
 transformer-based language models without expensive post-training.
 It combines an advanced implementation of directional ablation, also known
